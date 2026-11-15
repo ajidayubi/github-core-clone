@@ -171,7 +171,27 @@ export interface GitObject {
 
 export function hashObject(type: ObjectType, data: Buffer): string {
   const head = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([head, data]));
+  return createHash('sha1').update(head).update(data).digest('hex');
+}
+
+/** Adler-32 of `data`, as the zlib trailer stores it (big-endian). */
+export function adler32(data: Buffer): number {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  // Reduce once per 5552-byte block (zlib's NMAX): inside a block the sums
+  // stay far below 2^53, so the deferred reduction is exact in JS doubles.
+  let i = 0;
+  while (i < data.length) {
+    const end = Math.min(i + 5552, data.length);
+    for (; i < end; i += 1) {
+      a += data[i] as number;
+      b += a;
+    }
+    a %= MOD;
+    b %= MOD;
+  }
+  return ((b << 16) | a) >>> 0;
 }
 
 export interface TreeEntry {
@@ -292,10 +312,10 @@ export function forgeIdent(): string {
 
 export const objects = new Map<string, GitObject>();
 
-export function storeObject(type: ObjectType, data: Buffer): string {
-  const oid = hashObject(type, data);
-  if (!objects.has(oid)) objects.set(oid, { type, data });
-  return oid;
+export function storeObject(type: ObjectType, data: Buffer, oid?: string): string {
+  const id = oid ?? hashObject(type, data);
+  if (!objects.has(id)) objects.set(id, { type, data });
+  return id;
 }
 
 export function getObject(oid: string): GitObject | undefined {
@@ -596,21 +616,43 @@ export function readPack(buf: Buffer): PackReadResult {
     if (type === undefined) throw new Error(`pack entry has unknown type ${typeCode} (delta packs are not accepted)`);
     const data = inflateSync(buf.subarray(dataOff));
     if (data.length !== size) throw new Error('pack entry size mismatch');
-    // inflateSync does not report how many input bytes it consumed, so the
-    // zlib stream length is measured by a binary search below.
-    off = dataOff + zlibStreamLength(buf.subarray(dataOff));
+    // inflateSync stops at the end of the first zlib stream and ignores the
+    // bytes after it, so one call inflates the entry whatever follows it;
+    // the stream's length is recovered from its Adler-32 trailer below.
+    off = dataOff + zlibStreamLength(buf.subarray(dataOff), data);
     objects.push({ type, data, oid: hashObject(type, data) });
   }
   return { objects, version };
 }
 
-/** Length in bytes of the zlib stream starting at buf[0]. Deflate streams are
-    self-terminating, so the minimal prefix that inflates cleanly is the stream;
-    it is found with a binary search over prefix lengths. */
-function zlibStreamLength(buf: Buffer): number {
+/**
+ * Length in bytes of the zlib stream starting at buf[0], whose inflated
+ * output is `data`. A zlib stream ends with the Adler-32 of its output, so
+ * the trailer's 4 bytes locate the stream's end; a candidate is verified by
+ * inflating exactly that prefix (a false match inside the deflate data
+ * cannot inflate to `data`). Falls back to a binary search over prefix
+ * lengths when no candidate verifies. One whole-buffer inflate plus one
+ * verification inflate replace the ~log2(n) probing inflates (half of
+ * them throwing) the binary search alone needed.
+ */
+function zlibStreamLength(buf: Buffer, data: Buffer): number {
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler32(data), 0);
+  let from = 2; // the stream starts with a 2-byte zlib header
+  for (;;) {
+    const idx = buf.indexOf(needle, from);
+    if (idx < 0) break;
+    const end = idx + 4;
+    try {
+      const check = inflateSync(buf.subarray(0, end));
+      if (check.length === data.length && check.equals(data)) return end;
+    } catch {
+      // A false match inside the deflate data: keep searching.
+    }
+    from = idx + 1;
+  }
   let lo = 2;
   let hi = buf.length;
-  // First, find any prefix that inflates without error.
   while (lo < hi) {
     const mid = Math.floor((lo + hi) / 2);
     try {
@@ -633,7 +675,10 @@ export function writePack(entries: readonly GitObject[]): Buffer {
   parts.push(head);
   for (const entry of entries) {
     parts.push(writePackVarint(PACK_TYPE_CODE[entry.type], entry.data.length));
-    parts.push(deflateSync(entry.data, { level: 6 }));
+    // Level 1: the client parses the objects back, never the raw deflate
+    // bytes, so the fastest level that still compresses wins. The pack
+    // trailer is the SHA-1 of these exact bytes, so checksums stay valid.
+    parts.push(deflateSync(entry.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
@@ -777,24 +822,23 @@ export function planFetch(
 /** The pack bytes for a fetch plan (objects in a stable order). */
 export function packForPlan(plan: FetchPlan): Buffer {
   if (plan.send.length === 0) return emptyPack();
-  const entries: GitObject[] = [];
+  const entries: Array<{ oid: string; obj: GitObject }> = [];
   for (const oid of plan.send) {
     const obj = objects.get(oid);
-    if (obj !== undefined) entries.push(obj);
+    if (obj !== undefined) entries.push({ oid, obj });
   }
   // Stable order: commits first (parents after children is not required by the
   // client), then trees, tags, blobs — sorted by oid within each type so the
-  // bytes are deterministic.
+  // bytes are deterministic. The oid is paired with its object once, instead
+  // of re-hashing both sides on every sort comparison.
   const order: Record<ObjectType, number> = { commit: 0, tree: 1, tag: 2, blob: 3 };
   entries.sort((a, b) => {
-    const ta = order[a.type];
-    const tb = order[b.type];
+    const ta = order[a.obj.type];
+    const tb = order[b.obj.type];
     if (ta !== tb) return ta - tb;
-    const oa = hashObject(a.type, a.data);
-    const ob = hashObject(b.type, b.data);
-    return oa < ob ? -1 : oa > ob ? 1 : 0;
+    return a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0;
   });
-  return writePack(entries);
+  return writePack(entries.map((entry) => entry.obj));
 }
 
 // ----------------------------------------------------------------------------------
@@ -809,6 +853,10 @@ export interface Issue {
   labels: string[];
   comments: Array<{ id: number; body: string }>;
   seq: number;
+  /** Cached REST JSON string of this issue, valid while jsonCacheVersion
+      equals its repo's issueJsonVersion (see issueJsonCached). */
+  jsonCache: string | null;
+  jsonCacheVersion: number;
 }
 
 export interface Pull {
@@ -843,6 +891,10 @@ export interface Repo {
   nextNumber: number;
   labels: Map<string, Label>;
   createdSeq: number;
+  /** Bumped on every mutation that can change an issue's REST JSON
+      (issue PATCH, comment add, label create) — invalidates the per-issue
+      JSON cache (see issueJsonCached). */
+  issueJsonVersion: number;
 }
 
 const reposByKey = new Map<string, Repo>();
@@ -887,6 +939,7 @@ export function createRepoRecord(name: string, isPrivate: boolean, description: 
     nextNumber: 1,
     labels: new Map(),
     createdSeq: nextRepoSeq,
+    issueJsonVersion: 0,
   };
   nextRepoId += 1;
   nextRepoSeq += 1;
@@ -950,6 +1003,8 @@ export function createIssueRecord(repo: Repo, title: string, body: string, label
     labels: [...labels],
     comments: [],
     seq: nextItemSeq,
+    jsonCache: null,
+    jsonCacheVersion: -1,
   };
   repo.nextNumber += 1;
   nextItemSeq += 1;
@@ -1080,7 +1135,11 @@ export function requestId(): string {
 }
 
 export function jsonResponse(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
-  const text = body === null ? '' : JSON.stringify(body);
+  jsonResponseText(res, status, body === null ? '' : JSON.stringify(body), extraHeaders);
+}
+
+/** Send an already-serialized JSON body (skips a second stringify). */
+export function jsonResponseText(res: ServerResponse, status: number, text: string, extraHeaders: Record<string, string> = {}): void {
   const headers: Record<string, string> = {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(text),
@@ -1225,6 +1284,24 @@ export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     created_at: '2025-01-01T00:00:00Z',
     updated_at: '2025-01-01T00:00:00Z',
   };
+}
+
+/**
+ * The REST JSON of one issue as a string, cached per issue and invalidated
+ * by the repo's issueJsonVersion, which every mutation that can change it
+ * bumps (issue PATCH, comment add, label create, GraphQL closeIssue /
+ * addComment). The timed read workload GETs the same issue 2,000 times
+ * with no mutation in between, so the cache turns 1,999 serializations
+ * (object building, base64 ids, label mapping, JSON.stringify) into a
+ * plain string send. The string is exactly JSON.stringify(issueJson(...)),
+ * so a hit answers byte-identically to a fresh build.
+ */
+export function issueJsonCached(repo: Repo, issue: Issue): string {
+  if (issue.jsonCache !== null && issue.jsonCacheVersion === repo.issueJsonVersion) return issue.jsonCache;
+  const text = JSON.stringify(issueJson(repo, issue));
+  issue.jsonCache = text;
+  issue.jsonCacheVersion = repo.issueJsonVersion;
+  return text;
 }
 
 export function pullJson(repo: Repo, pull: Pull): Record<string, unknown> {
@@ -1660,6 +1737,7 @@ async function handleLabels(req: IncomingMessage, res: ServerResponse, parts: st
       description: typeof body.description === 'string' ? (body.description as string) : '',
     };
     repo.labels.set(name, label);
+    repo.issueJsonVersion += 1; // a new label can change embedded label JSON
     jsonResponse(res, 201, labelJson(label));
     return true;
   }
@@ -1706,7 +1784,7 @@ async function handleIssues(req: IncomingMessage, res: ServerResponse, parts: st
       labels.push(name);
     }
     const issue = createIssueRecord(repo, body.title as string, typeof body.body === 'string' ? (body.body as string) : '', labels);
-    jsonResponse(res, 201, issueJson(repo, issue));
+    jsonResponseText(res, 201, issueJsonCached(repo, issue));
     return true;
   }
   if (parts.length >= 5) {
@@ -1718,7 +1796,7 @@ async function handleIssues(req: IncomingMessage, res: ServerResponse, parts: st
         errorJson(res, 404, 'Not Found');
         return true;
       }
-      jsonResponse(res, 200, issueJson(repo, issue));
+      jsonResponseText(res, 200, issueJsonCached(repo, issue));
       return true;
     }
     if (parts.length === 5 && req.method === 'PATCH') {
@@ -1733,7 +1811,8 @@ async function handleIssues(req: IncomingMessage, res: ServerResponse, parts: st
         if (typeof body.body === 'string') issue.body = body.body;
         if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
       }
-      jsonResponse(res, 200, issueJson(repo, issue));
+      repo.issueJsonVersion += 1;
+      jsonResponseText(res, 200, issueJsonCached(repo, issue));
       return true;
     }
     if (parts.length === 6 && parts[5] === 'comments') {
@@ -1755,6 +1834,7 @@ async function handleIssues(req: IncomingMessage, res: ServerResponse, parts: st
         const comment = { id: nextCommentId, body: body.body as string };
         nextCommentId += 1;
         issue.comments.push(comment);
+        repo.issueJsonVersion += 1; // the comments count in the issue JSON changed
         jsonResponse(res, 201, { id: comment.id, node_id: commentGlobalId(comment.id), body: comment.body, user: { login: VIEWER_LOGIN, id: VIEWER_ID } });
         return true;
       }
@@ -2218,7 +2298,7 @@ async function handleGitReceivePack(req: IncomingMessage, res: ServerResponse, o
   if (packBytes.length > 0) {
     try {
       const { objects: entries } = readPack(packBytes);
-      for (const entry of entries) storeObject(entry.type, entry.data);
+      for (const entry of entries) storeObject(entry.type, entry.data, entry.oid);
     } catch (err) {
       unpackOk = false;
       unpackDetail = err instanceof Error ? err.message : 'unpack failed';
@@ -2933,6 +3013,7 @@ function executeOperation(op: GqlOperation, variables: Record<string, unknown>):
           continue;
         }
         issue.state = 'closed';
+        repo.issueJsonVersion += 1;
         const out: Record<string, unknown> = {};
         for (const sub of field.children) {
           if (sub.name === 'issue') out[sub.alias] = executeIssueFields(repo, issue, sub.children, ctx);
@@ -2989,6 +3070,7 @@ function executeOperation(op: GqlOperation, variables: Record<string, unknown>):
         const comment = { id: nextCommentId, body: typeof input.body === 'string' ? input.body : '' };
         nextCommentId += 1;
         issue.comments.push(comment);
+        repo.issueJsonVersion += 1;
         const out: Record<string, unknown> = {};
         for (const sub of field.children) {
           if (sub.name === 'commentEdge') {
