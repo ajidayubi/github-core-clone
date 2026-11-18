@@ -4,8 +4,16 @@
 // that port with the trial environment, waits until the environment reports
 // done, then terminates the child and exits 0. Exits 1 at once when
 // MAKEFUN_ENV_URL is not set.
+//
+// The forge binary is resolved next to this file (import.meta.url), NOT
+// relative to the process working directory: the live harness starts the
+// entrypoint from a directory other than the repo root, and a bare
+// "./forge" spawn fails there with ENOENT (round 3 scored 0 live for
+// exactly this reason: the trial made 0 requests, working false).
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
 const envUrl = process.env.MAKEFUN_ENV_URL;
 if (!envUrl) {
@@ -13,7 +21,12 @@ if (!envUrl) {
   process.exit(1);
 }
 
-const child = spawn("./forge", [], { stdio: ["ignore", "pipe", "inherit"] });
+const forgePath = join(dirname(fileURLToPath(import.meta.url)), "forge");
+const child = spawn(forgePath, [], { stdio: ["ignore", "pipe", "inherit"] });
+child.on("error", (err) => {
+  console.error(`failed to start ${forgePath}: ${err.message}`);
+  process.exit(1);
+});
 
 let port: number | null = null;
 let buffered = "";
